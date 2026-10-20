@@ -1,0 +1,2 @@
+# Local development only. Never set DEV_MODE on the deployed Worker.
+DEV_MODE="true"
