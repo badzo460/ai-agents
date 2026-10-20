@@ -121,7 +121,7 @@ Offline testovi mosta dodatno zahtijevaju dostupan `python3`, ali ne traže MT5 
 npm run test:bridge
 ```
 
-E2E testovi resetiraju lokalnu demo sobu i ključeve povezivanja; izvršavajte ih na lokalnom razvojnom okruženju. Razvojne provjere izvršene su u Linux okruženju; izvorno pokretanje na macOS-u i stvarni Windows MT5 terminal zahtijevaju provjeru na tim sustavima. Sama priprema projekta ne objavljuje aplikaciju na vašem Cloudflare računu.
+E2E testovi resetiraju lokalnu demo sobu i ključeve povezivanja; izvršavajte ih na lokalnom razvojnom okruženju. Lokalne razvojne provjere izvršene su na Linuxu. Build, TypeScript testovi, Python testovi s lažnim MT5 adapterom i E2E testovi prošli su i na izvornom macOS GitHub Actions runneru: [uspješna macOS provjera](https://github.com/badzo460/ai-agents/actions/runs/39500374434). Stvarna veza s Windows MT5 terminalom i izvršavanje naloga na PU Prime računu ostaju neprovjereni. Sama priprema projekta ne objavljuje aplikaciju na vašem Cloudflare računu.
 
 ## Arhitektura
 
