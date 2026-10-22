@@ -36,15 +36,63 @@ test('risk settings reject invalid limits and require exact live confirmation', 
   assert.throws(() => parseSettings({ allowLive: true }, DEFAULT_SETTINGS));
   assert.equal(parseSettings({ allowLive: true, liveConfirmation: 'LIVE XAUUSD' }, DEFAULT_SETTINGS).allowLive, true);
 });
-test('bridge rejects non-gold symbols, stale data, malformed candles and prices', () => {
+test('bridge rejects non-gold symbols, malformed candles and prices', () => {
   const now = Date.now(), good = createDemoSnapshot(now);
   assert.equal(parseSnapshot(good as unknown as Record<string, unknown>, now).symbol, good.symbol);
   assert.throws(() => parseSnapshot({ ...good, symbol: 'EURUSD' }, now));
-  assert.throws(() => parseSnapshot({ ...good, timestamp: now - 60000 }, now));
   assert.throws(() => parseSnapshot({ ...good, candles: [] }, now));
   assert.throws(() => parseSnapshot({ ...good, ask: good.bid - 1 }, now));
   assert.throws(() => parseSnapshot({ ...good, tickValue: NaN }, now));
   assert.throws(() => parseSnapshot({ ...good, candles: good.candles.map((c, i) => i === 0 ? { ...c, high: 0 } : c) }, now));
+});
+test('daily P&L conservative flag is optional and strictly boolean when supplied', () => {
+  const now = Date.now(), good = createDemoSnapshot(now);
+  assert.equal(parseSnapshot(good as unknown as Record<string, unknown>, now).dailyPnlConservative, undefined);
+  for (const dailyPnlConservative of [true, false]) assert.equal(parseSnapshot({ ...good, dailyPnlConservative, dailyPnlUpperBound: good.dailyPnl }, now).dailyPnlConservative, dailyPnlConservative);
+  for (const dailyPnlConservative of ['true', 'false', 0, 1, null, {}, []]) assert.throws(() => parseSnapshot({ ...good, dailyPnlConservative }, now));
+});
+test('conservative daily P&L requires a finite ordered upper bound and legacy exact values stay compatible', () => {
+  const now = Date.now(), good = createDemoSnapshot(now);
+  for (const dailyPnlConservative of [true, false, undefined]) {
+    const snapshot = { ...good, dailyPnl: -100, dailyPnlUpperBound: 200, ...(dailyPnlConservative === undefined ? {} : { dailyPnlConservative }) };
+    assert.equal(parseSnapshot(snapshot, now).dailyPnlUpperBound, 200);
+  }
+  assert.equal(parseSnapshot({ ...good, dailyPnlConservative: false }, now).dailyPnlUpperBound, undefined);
+  assert.throws(() => parseSnapshot({ ...good, dailyPnlConservative: true }, now));
+  for (const dailyPnlUpperBound of [-1, -1e12 - 1, 1e12 + 1, NaN, Infinity, '0', null]) {
+    for (const dailyPnlConservative of [true, false]) assert.throws(() => parseSnapshot({ ...good, dailyPnlConservative, dailyPnlUpperBound }, now));
+  }
+});
+test('quote telemetry retains historical and bounded future times but rejects impossible timestamps', () => {
+  const now = Date.now(), good = createDemoSnapshot(now);
+  for (const timestamp of [now - 3 * 86400000, now - 60000, now + 60000, now + 86400000]) {
+    assert.equal(parseSnapshot({ ...good, timestamp }, now).timestamp, timestamp);
+  }
+  for (const timestamp of [0, -1, Date.UTC(2000, 0, 1) - 1, now + 86400001, NaN, Infinity, String(now), null]) {
+    assert.throws(() => parseSnapshot({ ...good, timestamp }, now));
+  }
+  const futureBars = good.candles.map(candle => ({ ...candle, time: candle.time + 3600 }));
+  assert.deepEqual(parseSnapshot({ ...good, timestamp: now + 3600000, candles: futureBars }, now).candles, futureBars);
+  assert.throws(() => parseSnapshot({ ...good, candles: good.candles.map(candle => ({ ...candle, time: candle.time + 87000 })) }, now));
+});
+test('explicit broker UTC metadata must be paired, bounded and match the normalized quote time', () => {
+  const now = Date.now(), good = createDemoSnapshot(now);
+  for (const brokerUtcOffsetMinutes of [-720, 0, 180, 840]) {
+    const brokerTimestamp = now + brokerUtcOffsetMinutes * 60000;
+    const parsed = parseSnapshot({ ...good, brokerTimestamp, brokerUtcOffsetMinutes }, now);
+    assert.equal(parsed.timestamp, now);
+    assert.equal(parsed.brokerTimestamp, brokerTimestamp);
+    assert.equal(parsed.brokerUtcOffsetMinutes, brokerUtcOffsetMinutes);
+  }
+  assert.equal(parseSnapshot({ ...good, brokerTimestamp: now + 180 * 60000 + 1, brokerUtcOffsetMinutes: 180 }, now).timestamp, now);
+  for (const metadata of [
+    { brokerTimestamp: now },
+    { brokerUtcOffsetMinutes: 0 },
+    { brokerTimestamp: now, brokerUtcOffsetMinutes: 180 },
+    { brokerTimestamp: now + 180 * 60000 + 2, brokerUtcOffsetMinutes: 180 },
+    ...[-780, 900, 150, 180.5, NaN, Infinity, '180', null].map(brokerUtcOffsetMinutes => ({ brokerTimestamp: now, brokerUtcOffsetMinutes })),
+    ...[0, -1, NaN, Infinity, String(now), null].map(brokerTimestamp => ({ brokerTimestamp, brokerUtcOffsetMinutes: 0 })),
+  ]) assert.throws(() => parseSnapshot({ ...good, ...metadata }, now));
 });
 test('command safety blocks disconnected, paused, stale, real and cooling-down accounts', () => {
   const now = Date.now(), snapshot = createDemoSnapshot(now), settings = { ...DEFAULT_SETTINGS, enabled: true };
@@ -53,6 +101,8 @@ test('command safety blocks disconnected, paused, stale, real and cooling-down a
   assert.equal(canIssueCommand({ ...state, connected: false }, now, 0), false);
   assert.equal(canIssueCommand({ ...state, settings: { ...settings, enabled: false } }, now, 0), false);
   assert.equal(canIssueCommand({ ...state, bridgeLastSeen: now - 60000 }, now, 0), false);
+  assert.equal(canIssueCommand({ ...state, snapshot: { ...snapshot, timestamp: now - 30001 } }, now, 0), false);
+  assert.equal(canIssueCommand({ ...state, snapshot: { ...snapshot, timestamp: now + 5001 } }, now, 0), false);
   assert.equal(canIssueCommand({ ...state, snapshot: { ...snapshot, accountMode: 'real' } }, now, 0), false);
   assert.equal(canIssueCommand(state, now, now - 100), false);
   assert.equal(canIssueCommand({ ...state, mode: 'demo' }, now, 0), false);
@@ -83,6 +133,135 @@ function fixture(development = true) {
   }), env);
   return { call, env };
 }
+
+test('stale and future quotes keep account telemetry connected while automation cannot issue orders', async (t) => {
+  const now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  for (const { timestamp, candleOffset = 0 } of [
+    { timestamp: now - 3 * 86400000 },
+    { timestamp: now - 30001 },
+    { timestamp: now + 5001 },
+    { timestamp: now + 3600000 },
+    { timestamp: now + 3600000, candleOffset: 3600 },
+    { timestamp: now, candleOffset: 3600 },
+  ]) {
+    const { call } = fixture();
+    const pair = await (await call('/api/connection/pair', {})).json() as { token: string };
+    const auth = { authorization: `Bearer ${pair.token}` };
+    const fresh = { ...createDemoSnapshot(now), accountId: '123456@PUPrime-Demo', balance: 12345.67, equity: 12345.67 };
+    assert.ok(evaluate(fresh, { ...DEFAULT_SETTINGS, enabled: true }, now).order, 'control data should permit an order when its quote is fresh');
+    const snapshot = { ...fresh, timestamp, candles: fresh.candles.map(candle => ({ ...candle, time: candle.time + candleOffset })) };
+    assert.equal((await call('/api/bridge/snapshot', snapshot, auth)).status, 200);
+    const enable = await call('/api/settings', { enabled: true });
+    assert.equal(enable.status, 200, 'bridge heartbeat remains usable even when a quote cannot be traded');
+    assert.equal((await call('/api/bridge/snapshot', snapshot, auth)).status, 200);
+    const state = await (await call('/api/state')).json() as DashboardState;
+    assert.equal(state.mode, 'mt5');
+    assert.equal(state.connected, true);
+    assert.equal(state.bridgeLastSeen, now);
+    assert.equal(state.snapshot.accountId, fresh.accountId);
+    assert.equal(state.snapshot.balance, 12345.67);
+    assert.equal(state.snapshot.timestamp, timestamp, 'quote time must never be rewritten to the heartbeat time');
+    assert.deepEqual(state.snapshot.candles, snapshot.candles, 'broker bar timestamps must also remain unchanged');
+    assert.equal(state.settings.enabled, true);
+    assert.equal(state.evaluation.direction, 'WAIT');
+    assert.equal(state.evaluation.order, null);
+    assert.ok(state.evaluation.reasons.some(reason => /zastarjeli|vrijeme|svijeća/.test(reason)));
+    assert.equal(state.pendingCommand, null);
+    if (timestamp !== now) assert.equal(canIssueCommand(state, now, 0), false);
+    const delivery = await (await call('/api/bridge/command', undefined, auth)).json() as { command: unknown };
+    assert.equal(delivery.command, null);
+    const invalid = await call('/api/bridge/snapshot', { ...snapshot, timestamp: 0 }, auth);
+    assert.equal(invalid.status, 400);
+    const unchanged = await (await call('/api/state')).json() as DashboardState;
+    assert.equal(unchanged.snapshot.timestamp, timestamp, 'malformed telemetry must not overwrite the last valid snapshot');
+  }
+});
+
+test('explicit +3h broker normalization permits only genuinely fresh bounded orders', async (t) => {
+  const now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  for (const age of [0, 60000]) {
+    const { call } = fixture();
+    const pair = await (await call('/api/connection/pair', {})).json() as { token: string };
+    const auth = { authorization: `Bearer ${pair.token}` };
+    const normalized = now - age;
+    const snapshot = { ...createDemoSnapshot(now), symbol: 'XAUUSD.s', accountId: '123456@PUPrime-Demo', timestamp: normalized, brokerTimestamp: normalized + 3 * 3600000, brokerUtcOffsetMinutes: 180 };
+    assert.equal((await call('/api/bridge/snapshot', snapshot, auth)).status, 200);
+    assert.equal((await call('/api/settings', { enabled: true })).status, 200);
+    assert.equal((await call('/api/bridge/snapshot', snapshot, auth)).status, 200);
+    const state = await (await call('/api/state')).json() as DashboardState;
+    assert.equal(state.connected, true);
+    assert.equal(state.snapshot.timestamp, normalized);
+    assert.equal(state.snapshot.brokerTimestamp, snapshot.brokerTimestamp);
+    assert.equal(state.snapshot.brokerUtcOffsetMinutes, 180);
+    const { command } = await (await call('/api/bridge/command', undefined, auth)).json() as { command: DashboardState['pendingCommand'] };
+    if (age === 0) {
+      assert.ok(state.evaluation.order);
+      assert.ok(command, 'normalizing an explicitly configured broker clock should preserve a fresh quote');
+      assert.equal(command.symbol, 'XAUUSD.s');
+      const reservedLoss = (Math.abs(command.referencePrice - command.stopLoss) + command.maxDeviationPoints * snapshot.point) / snapshot.tickSize * snapshot.tickValue * command.volume;
+      assert.ok(reservedLoss <= snapshot.equity * state.settings.riskPercent / 100 + 1e-6);
+      assert.equal('brokerUtcOffsetMinutes' in command, false, 'timezone metadata does not change the order protocol');
+    } else {
+      assert.equal(state.evaluation.direction, 'WAIT');
+      assert.equal(state.evaluation.order, null);
+      assert.equal(state.pendingCommand, null);
+      assert.equal(command, null, 'an old raw quote remains old after applying the explicit offset');
+      assert.equal(canIssueCommand(state, now, 0), false);
+    }
+  }
+});
+
+test('bridge API rejects mismatched or incomplete UTC metadata without overwriting valid telemetry', async (t) => {
+  const now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const { call } = fixture();
+  const pair = await (await call('/api/connection/pair', {})).json() as { token: string };
+  const auth = { authorization: `Bearer ${pair.token}` };
+  const snapshot = { ...createDemoSnapshot(now), accountId: '123456@PUPrime-Demo', brokerTimestamp: now + 3 * 3600000, brokerUtcOffsetMinutes: 180, dailyPnlConservative: true, dailyPnlUpperBound: 0 };
+  const accepted = await call('/api/bridge/snapshot', snapshot, auth);
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(await accepted.json(), { ok: true, riskAccountingVersion: 2 });
+  for (const metadata of [
+    { brokerTimestamp: snapshot.brokerTimestamp + 2 },
+    { brokerUtcOffsetMinutes: 150 },
+    { brokerUtcOffsetMinutes: 900 },
+    { brokerUtcOffsetMinutes: -780 },
+    { brokerUtcOffsetMinutes: undefined },
+    { brokerTimestamp: undefined },
+    { dailyPnlConservative: 'true' },
+    { dailyPnlConservative: null },
+    { dailyPnlUpperBound: undefined },
+    { dailyPnlUpperBound: -1 },
+    { dailyPnlUpperBound: '0' },
+    { dailyPnlUpperBound: null },
+  ]) assert.equal((await call('/api/bridge/snapshot', { ...snapshot, ...metadata }, auth)).status, 400);
+  const state = await (await call('/api/state')).json() as DashboardState;
+  assert.equal(state.connected, true);
+  assert.equal(state.snapshot.brokerTimestamp, snapshot.brokerTimestamp);
+  assert.equal(state.snapshot.brokerUtcOffsetMinutes, 180);
+  assert.equal(state.snapshot.dailyPnlConservative, true);
+  assert.equal(state.snapshot.dailyPnlUpperBound, 0);
+});
+
+test('risk accounting capability v2 never inflates daily risk from an ambiguous P&L lower bound', async (t) => {
+  const now = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const { call } = fixture();
+  const pair = await (await call('/api/connection/pair', {})).json() as { token: string };
+  const auth = { authorization: `Bearer ${pair.token}` };
+  const snapshot = { ...createDemoSnapshot(now), accountId: '123456@PUPrime-Demo', brokerTimestamp: now + 3 * 3600000, brokerUtcOffsetMinutes: 180, dailyPnl: 100, dailyPnlUpperBound: 10000, dailyPnlConservative: true };
+  assert.equal((await call('/api/bridge/snapshot', snapshot, auth)).status, 200);
+  assert.equal((await call('/api/settings', { enabled: true })).status, 200);
+  const response = await call('/api/bridge/snapshot', snapshot, auth);
+  assert.deepEqual(await response.json(), { ok: true, riskAccountingVersion: 2 });
+  const state = await (await call('/api/state')).json() as DashboardState;
+  assert.equal(state.snapshot.dailyPnlUpperBound, 10000);
+  assert.equal(state.evaluation.order, null, 'balance minus upper P&L gives zero opening balance; current balance must not replace it');
+  assert.equal(state.pendingCommand, null);
+  assert.deepEqual(await (await call('/api/bridge/command', undefined, auth)).json(), { command: null });
+});
 
 test('HTTP API keeps account private and enforces login, origin and signed session', async () => {
   const { call, env } = fixture(false);

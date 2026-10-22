@@ -119,6 +119,59 @@ test('floating losses and already reserved position risk reduce or block daily b
   assert.equal(evaluate({ ...snapshot, positions: [{ ...openRisk, stopLoss: 0 }] }, { ...settings, maxPositions: 2 }, NOW).order, null);
 });
 
+test('conservative positive-day bounds never enlarge the exact upper-bound daily budget', () => {
+  const snapshot = { ...trending(), volumeMin: 0.0001, volumeStep: 0.0001 };
+  const dailyLimited = { ...settings, riskPercent: 0.5, maxDailyLossPercent: 0.5 };
+  const exact = evaluate({ ...snapshot, dailyPnl: 200 }, dailyLimited, NOW).order;
+  const bounded = evaluate({ ...snapshot, dailyPnl: 100, dailyPnlUpperBound: 200, dailyPnlConservative: true }, dailyLimited, NOW).order;
+  assert.ok(exact);
+  assert.ok(bounded);
+  assert.ok(bounded.volume <= exact.volume, 'under-counted gains must not inflate the opening balance or lot size');
+  const worstEntry = bounded.referencePrice + bounded.maxDeviationPoints * snapshot.point;
+  const risk = Math.abs(worstEntry - bounded.stopLoss) / snapshot.tickSize * snapshot.tickValue * bounded.volume;
+  assert.ok(risk <= (snapshot.balance - 200) * dailyLimited.maxDailyLossPercent / 100 + 1e-6);
+});
+
+test('conservative bounds spanning losses and gains reserve loss against the smallest opening balance', () => {
+  const snapshot = { ...trending(), volumeMin: 0.0001, volumeStep: 0.0001 };
+  const dailyLimited = { ...settings, riskPercent: 0.5, maxDailyLossPercent: 0.5 };
+  const lower = -30, upper = 40;
+  for (const floatingLoss of [0, 10]) {
+    const account = { ...snapshot, equity: snapshot.balance - floatingLoss };
+    const bounded = evaluate({ ...account, dailyPnl: lower, dailyPnlUpperBound: upper, dailyPnlConservative: true }, dailyLimited, NOW).order;
+    assert.ok(bounded);
+    for (const actualPnl of [lower, 0, upper]) {
+      const exact = evaluate({ ...account, dailyPnl: actualPnl }, dailyLimited, NOW).order;
+      assert.ok(exact);
+      assert.ok(bounded.volume <= exact.volume, 'bounded risk must be no greater than any plausible exact daily result');
+    }
+    const worstEntry = bounded.referencePrice + bounded.maxDeviationPoints * snapshot.point;
+    const risk = Math.abs(worstEntry - bounded.stopLoss) / snapshot.tickSize * snapshot.tickValue * bounded.volume;
+    const conservativeBudget = (snapshot.balance - upper) * dailyLimited.maxDailyLossPercent / 100 + lower - floatingLoss;
+    assert.ok(risk <= conservativeBudget + 1e-6);
+  }
+  const exhausted = evaluate({ ...snapshot, equity: snapshot.balance - 20, dailyPnl: lower, dailyPnlUpperBound: upper, dailyPnlConservative: true }, dailyLimited, NOW);
+  assert.equal(exhausted.order, null, 'floating losses can exhaust the bounded daily budget');
+});
+
+test('conservative daily accounting rejects missing, nonfinite, inverted or nonpositive-baseline bounds', () => {
+  const snapshot = trending();
+  for (const upper of [undefined, NaN, Infinity, -Infinity, 99, snapshot.balance, snapshot.balance + 1]) {
+    const evaluation = evaluate({ ...snapshot, dailyPnl: 100, dailyPnlUpperBound: upper, dailyPnlConservative: true }, settings, NOW);
+    assert.equal(evaluation.direction, 'WAIT');
+    assert.equal(evaluation.order, null);
+    assert.ok(evaluation.reasons.some(reason => reason.includes('Granice dnevnog rezultata')));
+  }
+});
+
+test('absent conservative-accounting flag preserves exact legacy daily-P&L behavior', () => {
+  const snapshot = { ...trending(), dailyPnl: 100 };
+  const exact = evaluate(snapshot, settings, NOW);
+  const explicitExact = evaluate({ ...snapshot, dailyPnlConservative: false }, settings, NOW);
+  assert.ok(exact.order);
+  assert.deepEqual(explicitExact, exact);
+});
+
 test('extreme RSI vetoes entries even when trend and price momentum agree', () => {
   const snapshot = trending();
   snapshot.candles = snapshot.candles.map((c, i) => ({ ...c, open: 3300 + i * .2, close: 3300.1 + i * .2, high: 3300.3 + i * .2, low: 3299.9 + i * .2 }));

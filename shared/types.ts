@@ -4,9 +4,12 @@ export interface Candle { time: number; open: number; high: number; low: number;
 export interface Position { ticket: string; symbol: string; side: 'BUY' | 'SELL'; volume: number; openPrice: number; currentPrice: number; profit: number; stopLoss: number; takeProfit: number }
 export interface MarketSnapshot {
   symbol: string; timestamp: number; bid: number; ask: number;
+  brokerTimestamp?: number; brokerUtcOffsetMinutes?: number;
   point: number; tickSize: number; tickValue: number; volumeMin: number; volumeMax: number; volumeStep: number;
   balance: number; equity: number; accountId: string; accountMode: 'demo' | 'real';
   currency: string; dailyPnl: number; positions: Position[]; candles: Candle[];
+  dailyPnlConservative?: boolean;
+  dailyPnlUpperBound?: number;
   news?: { headline: string; impact: 'low' | 'medium' | 'high'; timestamp: number; blackout: boolean }[];
 }
 export interface AgentResult { id: AgentId; name: string; role: string; status: 'working' | 'ready' | 'blocked'; signal: Direction; confidence: number; summary: string; metrics: { label: string; value: string }[] }

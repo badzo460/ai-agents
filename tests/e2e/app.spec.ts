@@ -49,6 +49,11 @@ test('mobile dashboard has no horizontal page overflow and pairing stays explici
   await expect(page.getByRole('button', { name: 'Generiraj ključ' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Generiraj ključ' })).toBeDisabled();
   await expect(page.getByText('Prijavi se u PU Prime MT5', { exact: true })).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'Naziv simbola u MT5' })).toHaveValue('XAUUSD.s');
+  const brokerOffset = page.getByRole('spinbutton', { name: 'UTC pomak vremena ticka (sati)' });
+  await expect(brokerOffset).toHaveValue('0');
+  await brokerOffset.fill('3');
+  await expect(brokerOffset).toHaveValue('3');
   await page.getByRole('button', { name: 'Zatvori', exact: true }).click();
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: 'test-results/aurum-mobile.png', fullPage: true });
@@ -82,4 +87,29 @@ test('paired bridge queues only gold and honors pause, revocation and account bi
 test('cross-origin mutations and real-account activation without confirmation fail', async ({ request }) => {
   expect((await request.post('/api/settings', { headers: { Origin: 'https://attacker.invalid' }, data: { enabled: true } })).status()).toBe(403);
   expect((await request.post('/api/settings', { headers: { Origin: origin }, data: { allowLive: true } })).status()).toBe(400);
+});
+
+test('connected MT5 account remains visible while stale or future quotes block orders', async ({ page, request }) => {
+  const mutation = { Origin: origin };
+  const pair = await (await request.post('/api/connection/pair', { headers: mutation, data: {} })).json();
+  const auth = { Authorization: `Bearer ${pair.token}` };
+  const snapshot = { ...createDemoSnapshot(), accountId: 'PU-DEMO-CLOCK', balance: 12345.67, equity: 12345.67, dailyPnl: 0, dailyPnlConservative: true, dailyPnlUpperBound: 0, timestamp: Date.now() - 120_000 };
+  expect((await request.post('/api/bridge/snapshot', { headers: auth, data: snapshot })).ok()).toBeTruthy();
+  expect((await request.post('/api/settings', { headers: mutation, data: { enabled: true } })).ok()).toBeTruthy();
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: 'MT5 povezan', exact: true })).toBeVisible();
+  await expect(page.getByText('$12,345.67', { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole('status')).toContainText('MT5 račun je povezan.');
+  await expect(page.getByRole('status')).toContainText('Cijena je starija od 30 sekundi.');
+  await expect(page.getByTestId('quote-age')).toContainText('+');
+  await expect(page.getByText('KONZERVATIVNI DNEVNI P&L', { exact: true })).toBeVisible();
+  await page.getByText('Objašnjenje procjene', { exact: true }).click();
+  await expect(page.getByText(/UTC granica dana u povijesti poslova/)).toBeVisible();
+  expect((await (await request.get('/api/bridge/command', { headers: auth })).json()).command).toBeNull();
+
+  expect((await request.post('/api/bridge/snapshot', { headers: auth, data: { ...snapshot, timestamp: Date.now() + 60_000 } })).ok()).toBeTruthy();
+  await page.reload();
+  await expect(page.getByRole('status')).toContainText('Vrijeme cijene je u budućnosti.');
+  await expect(page.getByTestId('quote-age')).toContainText('-');
+  expect((await (await request.get('/api/bridge/command', { headers: auth })).json()).command).toBeNull();
 });

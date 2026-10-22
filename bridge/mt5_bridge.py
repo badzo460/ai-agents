@@ -8,7 +8,7 @@ economic-calendar feed. Run --help for the supported arguments.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -193,7 +193,102 @@ def account_identity(account: object) -> str:
     return identity
 
 
-def snapshot_from_terminal(mt5: object, symbol: str) -> dict:
+def tick_timestamp_ms(tick: object) -> tuple[int, str]:
+    """Use the actual broker timestamp; never synthesize or offset a quote."""
+    milliseconds = getattr(tick, "time_msc", None)
+    if milliseconds is not None and milliseconds != 0:
+        return int(number(milliseconds, "time_msc", positive=True)), "time_msc"
+    seconds = number(getattr(tick, "time", None), "time", positive=True)
+    return int(seconds * 1000), "time (fallback)"
+
+
+def broker_offset_ms(broker_utc_offset_hours: int = 0) -> int:
+    if isinstance(broker_utc_offset_hours, bool) or not isinstance(broker_utc_offset_hours, int) or not -12 <= broker_utc_offset_hours <= 14:
+        raise BridgeError("Brokerov UTC pomak mora biti cijeli broj sati od -12 do 14.")
+    return broker_utc_offset_hours * 3600000
+
+
+def normalize_broker_timestamp(raw_ms: int, broker_utc_offset_hours: int = 0) -> int:
+    """Convert only the explicitly configured broker clock to UTC."""
+    normalized = int(number(raw_ms, "broker timestamp", positive=True)) - broker_offset_ms(broker_utc_offset_hours)
+    if normalized <= 0:
+        raise BridgeError("Brokerova vremenska oznaka nakon UTC konverzije nije valjana.")
+    return normalized
+
+
+def expanded_history_bounds(start: datetime, end: datetime, broker_utc_offset_hours: int = 0) -> tuple[datetime, datetime]:
+    """Query both interpretations, then filter records by normalized UTC time."""
+    padding = timedelta(milliseconds=abs(broker_offset_ms(broker_utc_offset_hours)))
+    return start - padding, end + padding
+
+
+def validate_tick_time(stamp: int, now_ms: int) -> float:
+    """Return signed age, retaining the existing +30 s / -5 s limits."""
+    age_seconds = (now_ms - stamp) / 1000
+    if stamp > now_ms + 5000:
+        raise BridgeError(f"Vrijeme XAUUSD ticka je u budućnosti (PC - tick: {age_seconds:+.3f} s). Provjerite UTC sat računala i izričito odabrani brokerov UTC pomak; trgovanje čeka ispravne podatke.")
+    if now_ms - stamp > 30000:
+        raise BridgeError(f"Posljednji XAUUSD tick je stariji od 30 sekundi (PC - tick: {age_seconds:+.3f} s). Provjerite MT5 kotacije, UTC sat računala i odabrani brokerov UTC pomak; trgovanje čeka svježe podatke.")
+    return age_seconds
+
+
+def format_utc_ms(stamp: int) -> str:
+    try:
+        return datetime.fromtimestamp(stamp / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except (ValueError, OverflowError, OSError):
+        raise BridgeError("Vremenska oznaka ticka nije valjan UTC datum.") from None
+
+
+def diagnose_terminal(mt5: object, symbol: str, interval: float = 5, broker_utc_offset_hours: int = 0) -> int:
+    """Inspect two quote samples without account data, mutation or execution."""
+    if not is_gold_symbol(symbol):
+        raise BridgeError("Dijagnostika je dopuštena samo za XAUUSD i izričit brokerov sufiks.")
+    broker_offset_ms(broker_utc_offset_hours)
+    terminal = mt5.terminal_info()
+    print("Dijagnostika MT5: samo čitanje; podaci računa i tajne se ne ispisuju.")
+    print("Terminal povezan: " + ("DA" if terminal is not None and getattr(terminal, "connected", False) else "NE"))
+    if terminal is None:
+        raise BridgeError("MT5 terminal nije dostupan. Pokrenite željeni terminal ili navedite --terminal-path.")
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        raise BridgeError("Odabrani XAUUSD simbol nije pronađen. Provjerite njegov točan naziv u MT5 Market Watchu.")
+    actual_symbol = getattr(info, "name", symbol)
+    if not is_gold_symbol(actual_symbol) or actual_symbol != symbol:
+        raise BridgeError("MT5 je vratio drugi simbol; dijagnostika neće pretpostaviti naziv brokerova instrumenta.")
+    print("Simbol: " + actual_symbol)
+    print(f"Brokerov UTC pomak: {broker_utc_offset_hours:+d} h (izričita postavka)")
+    stamps = []
+    for sample in range(2):
+        if sample:
+            time.sleep(interval)
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            raise BridgeError("MT5 nema tick za odabrani simbol. Otvorite ga u Market Watchu i provjerite kotacije.")
+        raw_stamp, source = tick_timestamp_ms(tick)
+        stamp = normalize_broker_timestamp(raw_stamp, broker_utc_offset_hours)
+        now_ms = int(time.time() * 1000)
+        stamps.append(stamp)
+        print(f"Uzorak {sample + 1}/2")
+        print("PC UTC: " + format_utc_ms(now_ms))
+        print(f"Sirovi broker timestamp: {raw_stamp}")
+        print("Vrijeme brokera prije UTC konverzije: " + format_utc_ms(raw_stamp).removesuffix("Z"))
+        print("Tick UTC: " + format_utc_ms(stamp))
+        print("Izvor vremena: " + source)
+        print(f"Starost ticka (PC - tick): {(now_ms - stamp) / 1000:+.3f} s")
+        try:
+            validate_tick_time(stamp, now_ms)
+            print("Svježina ticka: unutar dopuštenih granica.")
+        except BridgeError as error:
+            print(str(error))
+    progression = "DA" if stamps[1] > stamps[0] else "NE" if stamps[1] == stamps[0] else "NE (vrijeme se vratilo)"
+    print("Tick napreduje: " + progression)
+    print("Ako broker promijeni UTC pomak ili ljetno vrijeme, provjerite postavku; stari pomak ne zaobilazi provjere svježine.")
+    print("Dijagnostika završena. Nisu poslani mrežni zahtjevi ni nalozi.")
+    return 0
+
+
+def snapshot_from_terminal(mt5: object, symbol: str, require_fresh: bool = True, broker_utc_offset_hours: int = 0) -> dict:
+    offset_ms = broker_offset_ms(broker_utc_offset_hours)
     account = mt5.account_info()
     terminal = mt5.terminal_info()
     if account is None or terminal is None or not terminal.connected:
@@ -205,23 +300,49 @@ def snapshot_from_terminal(mt5: object, symbol: str) -> dict:
         raise BridgeError("XAUUSD simbol nije pronađen u MT5 Market Watchu.")
     if getattr(info, "currency_base", "") not in ("", "XAU") or getattr(info, "currency_profit", "") not in ("", "USD"):
         raise BridgeError("Brokerovi podaci ne prepoznaju odabrani simbol kao zlato/USD.")
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        raise BridgeError("Broker još nema cijenu za XAUUSD.")
     rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M5, 0, 120)
     if rates is None or len(rates) < 40:
         raise BridgeError("Nedostaje najmanje 40 M5 svijeća. Otvorite XAUUSD M5 graf u terminalu.")
     positions = mt5.positions_get()
     if positions is None:
         raise BridgeError("MT5 nije vratio popis otvorenih pozicija.")
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    deals = mt5.history_deals_get(today, datetime.now(timezone.utc))
+    now = datetime.fromtimestamp(time.time(), timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    history_start, history_end = expanded_history_bounds(today, now, broker_utc_offset_hours)
+    deals = mt5.history_deals_get(history_start, history_end)
     if deals is None:
         raise BridgeError("MT5 nije vratio današnju povijest potrebnu za limit gubitka.")
-    daily_pnl = sum(float(getattr(d, key, 0)) for d in deals if d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL) for key in ("profit", "commission", "swap", "fee"))
-    stamp = int(getattr(tick, "time_msc", 0) or tick.time * 1000)
+    day_start_ms, day_end_ms = int(today.timestamp() * 1000), int(now.timestamp() * 1000)
+    daily_pnl = 0.0
+    daily_pnl_upper = 0.0
+    for deal in deals:
+        if deal.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL):
+            continue
+        raw_deal_ms, _ = tick_timestamp_ms(deal)
+        deal_utc_ms = normalize_broker_timestamp(raw_deal_ms, broker_utc_offset_hours)
+        raw_in_day = day_start_ms <= raw_deal_ms <= day_end_ms
+        converted_in_day = day_start_ms <= deal_utc_ms <= day_end_ms
+        net = sum(number(getattr(deal, key, 0), key) for key in ("profit", "commission", "swap", "fee"))
+        # Quote clock measurements do not prove the history API's encoding.
+        # Until deal-clock provenance is verified, retain a lower bound under
+        # both possible interpretations: ambiguous losses count, ambiguous
+        # gains do not. At offset zero the interpretations are identical.
+        if (net < 0 and (raw_in_day or converted_in_day)) or (net >= 0 and raw_in_day and converted_in_day):
+            daily_pnl += net
+        # The upper bound also constrains the opening-balance estimate used
+        # for the daily risk budget; a lower P&L alone could inflate that base.
+        if (net < 0 and raw_in_day and converted_in_day) or (net >= 0 and (raw_in_day or converted_in_day)):
+            daily_pnl_upper += net
+    # History and initial candle loading can block. Read the broker's latest
+    # actual tick after that work so validation measures the current quote.
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        raise BridgeError("Broker još nema cijenu za XAUUSD.")
+    raw_stamp, _ = tick_timestamp_ms(tick)
+    stamp = normalize_broker_timestamp(raw_stamp, broker_utc_offset_hours)
     snapshot = {
         "symbol": symbol, "timestamp": stamp,
+        "brokerTimestamp": raw_stamp, "brokerUtcOffsetMinutes": broker_utc_offset_hours * 60,
         "bid": float(tick.bid), "ask": float(tick.ask),
         "point": float(info.point), "tickSize": float(info.trade_tick_size),
         # Use the larger adverse/profit tick valuation when available.
@@ -230,13 +351,15 @@ def snapshot_from_terminal(mt5: object, symbol: str) -> dict:
         "balance": float(account.balance), "equity": float(account.equity),
         "accountId": account_identity(account), "accountMode": account_mode(account, mt5),
         "currency": account.currency, "dailyPnl": daily_pnl,
+        "dailyPnlConservative": broker_utc_offset_hours != 0,
+        "dailyPnlUpperBound": daily_pnl_upper,
         "positions": [{"ticket": str(p.ticket), "symbol": p.symbol, "side": "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL", "volume": float(p.volume), "openPrice": float(p.price_open), "currentPrice": float(p.price_current), "profit": float(p.profit), "stopLoss": float(p.sl), "takeProfit": float(p.tp)} for p in positions],
-        "candles": [{"time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"]), "volume": float(r["tick_volume"])} for r in rates],
+        "candles": [{"time": int(r["time"]) - offset_ms // 1000, "open": float(r["open"]), "high": float(r["high"]), "low": float(r["low"]), "close": float(r["close"]), "volume": float(r["tick_volume"])} for r in rates],
     }
     for key in ("point", "tickSize", "tickValue", "volumeMin", "volumeMax", "volumeStep", "bid", "ask"):
         number(snapshot[key], key, positive=True)
-    if stamp > int(time.time() * 1000) + 5000 or int(time.time() * 1000) - stamp > 30000:
-        raise BridgeError("Posljednji XAUUSD tick je stariji od 30 sekundi; trgovanje je zaustavljeno.")
+    if require_fresh:
+        validate_tick_time(stamp, int(time.time() * 1000))
     return snapshot
 
 
@@ -244,20 +367,37 @@ def command_comment(command_id: str) -> str:
     return "AU:" + hashlib.sha256(command_id.encode()).hexdigest()[:20]
 
 
-def reconcile_pending(mt5: object, command: dict) -> dict:
+def reconcile_pending(mt5: object, command: dict, broker_utc_offset_hours: int = 0) -> dict:
     """Inspect rather than repeat an order with an uncertain prior outcome."""
+    broker_offset_ms(broker_utc_offset_hours)
     comment = command_comment(command["id"])
     positions = mt5.positions_get()
     if positions is not None:
         for p in positions:
             if getattr(p, "comment", "") == comment and getattr(p, "symbol", "") == command.get("symbol"):
                 return {"commandId": command["id"], "status": "filled", "ticket": str(p.ticket), "price": float(p.price_open), "volume": float(p.volume), "message": "Postojeća pozicija potvrđena nakon ponovnog pokretanja mosta."}
-    start = datetime.fromtimestamp(max(0, command.get("createdAt", 0) / 1000 - 120), timezone.utc)
-    deals = mt5.history_deals_get(start, datetime.now(timezone.utc))
+    now_ms = int(time.time() * 1000)
+    created_ms = number(command.get("createdAt"), "createdAt", positive=True)
+    # Automatic reconciliation is deliberately bounded. An older unresolved
+    # execution requires manual inspection, never a repeated submission.
+    start_ms = max(0, now_ms - 86400000, min(created_ms - 120000, now_ms))
+    start = datetime.fromtimestamp(start_ms / 1000, timezone.utc)
+    end = datetime.fromtimestamp(now_ms / 1000, timezone.utc)
+    history_start, history_end = expanded_history_bounds(start, end, broker_utc_offset_hours)
+    deals = mt5.history_deals_get(history_start, history_end)
     if deals is not None:
         for d in deals:
             if getattr(d, "comment", "") == comment and getattr(d, "symbol", "") == command.get("symbol"):
-                return {"commandId": command["id"], "status": "filled", "ticket": str(d.ticket), "price": float(d.price), "volume": float(d.volume), "message": "Izvršenje potvrđeno u povijesti nakon ponovnog pokretanja mosta."}
+                try:
+                    raw_deal_ms, _ = tick_timestamp_ms(d)
+                    deal_utc_ms = normalize_broker_timestamp(raw_deal_ms, broker_utc_offset_hours)
+                except BridgeError:
+                    continue
+                # The unique command comment and symbol identify execution;
+                # accept either bounded time interpretation until this
+                # terminal's deal-clock encoding is verified independently.
+                if start_ms <= raw_deal_ms <= now_ms or start_ms <= deal_utc_ms <= now_ms:
+                    return {"commandId": command["id"], "status": "filled", "ticket": str(d.ticket), "price": float(d.price), "volume": float(d.volume), "message": "Izvršenje potvrđeno u povijesti nakon ponovnog pokretanja mosta."}
     return {"commandId": command["id"], "status": "rejected", "message": "Neizvjestan prethodni pokušaj: nalog nije ponovljen. Ručno provjerite MT5 pozicije i povijest."}
 
 
@@ -307,7 +447,8 @@ def prepare_request(mt5: object, command: dict, snapshot: dict) -> dict:
     return request
 
 
-def process_command(mt5: object, ledger: Ledger, command: dict, symbol: str, allow_live: bool) -> dict:
+def process_command(mt5: object, ledger: Ledger, command: dict, symbol: str, allow_live: bool, broker_utc_offset_hours: int = 0) -> dict:
+    broker_offset_ms(broker_utc_offset_hours)
     command_id = command.get("id")
     if not isinstance(command_id, str) or not 1 <= len(command_id) <= 120:
         raise BridgeError("Poslužitelj je poslao neispravan ID naloga.")
@@ -315,12 +456,12 @@ def process_command(mt5: object, ledger: Ledger, command: dict, symbol: str, all
     if previous:
         if previous["status"] != "pending":
             return previous["payload"]
-        result = reconcile_pending(mt5, command)
+        result = reconcile_pending(mt5, command, broker_utc_offset_hours=broker_utc_offset_hours)
         ledger.complete(command_id, result["status"], result)
         if result["status"] == "rejected":
             ledger.halt()
         return result
-    snapshot = snapshot_from_terminal(mt5, symbol)
+    snapshot = snapshot_from_terminal(mt5, symbol, require_fresh=True, broker_utc_offset_hours=broker_utc_offset_hours)
     try:
         if ledger.has_pending():
             # A different expired server command may have executed immediately
@@ -334,7 +475,7 @@ def process_command(mt5: object, ledger: Ledger, command: dict, symbol: str, all
         # The broker's margin/order_check call can block. A fresh terminal read
         # rechecks expiry, spread, account, positions and price deviation before
         # committing the send; updating price never widens allowed deviation.
-        fresh_snapshot = snapshot_from_terminal(mt5, symbol)
+        fresh_snapshot = snapshot_from_terminal(mt5, symbol, require_fresh=True, broker_utc_offset_hours=broker_utc_offset_hours)
         validate_command(command, fresh_snapshot, int(time.time() * 1000), allow_live)
         request["price"] = fresh_snapshot["ask"] if command["side"] == "BUY" else fresh_snapshot["bid"]
     except BridgeError as error:
@@ -349,13 +490,13 @@ def process_command(mt5: object, ledger: Ledger, command: dict, symbol: str, all
     except Exception:
         sent = None
     if sent is None:
-        result = reconcile_pending(mt5, command)
+        result = reconcile_pending(mt5, command, broker_utc_offset_hours=broker_utc_offset_hours)
     elif sent.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL):
         partial = sent.retcode == mt5.TRADE_RETCODE_DONE_PARTIAL
         result = {"commandId": command_id, "status": "filled", "ticket": str(sent.order or sent.deal), "price": float(sent.price), "volume": float(getattr(sent, "volume", command["volume"])), "message": "Djelomično izvršenje; ostatak nije ponovljen." if partial else "MT5 je potvrdio izvršenje."}
     else:
         uncertain = sent.retcode in (getattr(mt5, "TRADE_RETCODE_TIMEOUT", 10012), getattr(mt5, "TRADE_RETCODE_CONNECTION", 10031), getattr(mt5, "TRADE_RETCODE_ERROR", 10011))
-        result = reconcile_pending(mt5, command) if uncertain else {"commandId": command_id, "status": "rejected", "message": f"MT5 nije potvrdio izvršenje (kod {sent.retcode}); nalog nije ponovljen."}
+        result = reconcile_pending(mt5, command, broker_utc_offset_hours=broker_utc_offset_hours) if uncertain else {"commandId": command_id, "status": "rejected", "message": f"MT5 nije potvrdio izvršenje (kod {sent.retcode}); nalog nije ponovljen."}
     if result["status"] == "rejected" and result.get("message", "").startswith("Neizvjestan"):
         ledger.halt()
     ledger.complete(command_id, result["status"], result)
@@ -422,17 +563,46 @@ def ledger_location(account_id: str, url: str) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Aurum XAUUSD / PU Prime MT5 HTTPS most (Windows x64, Python 3.12). Lozinka MT5 računa ostaje u lokalnom terminalu.")
-    parser.add_argument("--url", required=True, help="HTTPS URL iz prozora Poveži MT5, završava /api/bridge")
+    parser.add_argument("--url", help="HTTPS URL iz prozora Poveži MT5, završava /api/bridge (obavezno izvan --diagnose načina)")
     parser.add_argument("--token-env", default="AURUM_BRIDGE_TOKEN", help="Naziv varijable okruženja koja sadrži token; vrijednost nije CLI argument")
     parser.add_argument("--symbol", default="XAUUSD", help="Točan brokerov XAUUSD simbol; dopušten sufiks npr. XAUUSD.m")
     parser.add_argument("--allow-live", action="store_true", help="Izričito dopusti izvršenje na stvarnom računu; web također mora potvrditi LIVE XAUUSD")
     parser.add_argument("--terminal-path", help="Opcionalna putanja postojećeg MT5 terminal64.exe")
     parser.add_argument("--interval", type=float, default=5, help="Razmak provjere u sekundama, 2–60 (zadano 5)")
+    parser.add_argument("--diagnose", action="store_true", help="Samo pročitaj dvije MT5 kotacije i UTC vremena; ne treba URL/token, ne šalje mrežne zahtjeve ni naloge")
+    parser.add_argument("--broker-utc-offset-hours", type=int, choices=range(-12, 15), default=0, help="Izričiti UTC pomak brokerovih tickova, svijeća i deal vremena (zadano 0 = UTC); npr. 3 za potvrđeni brokerov UTC+3 sat")
     args = parser.parse_args(argv)
     if not is_gold_symbol(args.symbol):
         parser.error("dopušten je samo XAUUSD ili eksplicitan sufiks, npr. XAUUSD.m")
     if not math.isfinite(args.interval) or not 2 <= args.interval <= 60:
         parser.error("--interval mora biti između 2 i 60 sekundi")
+    if args.diagnose:
+        try:
+            import MetaTrader5 as mt5
+        except ImportError:
+            print("Za dijagnostiku instalirajte MetaTrader5 paket u Windows x64 Python 3.12 okruženju; requests i web token nisu potrebni.", file=sys.stderr)
+            return 2
+        try:
+            initialized = mt5.initialize(args.terminal_path) if args.terminal_path else mt5.initialize()
+            if not initialized:
+                raise BridgeError("MT5 initialize nije uspio. Pokrenite željeni terminal ili navedite --terminal-path.")
+            return diagnose_terminal(mt5, args.symbol, args.interval, broker_utc_offset_hours=args.broker_utc_offset_hours)
+        except BridgeError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            print("\nDijagnostika je prekinuta; nalozi nisu slani.")
+            return 0
+        except Exception:
+            print("Dijagnostika nije mogla pročitati MT5 podatke. Provjerite terminal i naziv simbola; nalozi nisu slani.", file=sys.stderr)
+            return 2
+        finally:
+            try:
+                mt5.shutdown()
+            except Exception:
+                print("MT5 dijagnostičku vezu nije bilo moguće uredno zatvoriti.", file=sys.stderr)
+    if not args.url:
+        parser.error("--url je obavezan za povezivanje; za lokalnu provjeru bez tokena upotrijebite --diagnose")
     token = os.environ.get(args.token_env, "")
     if not token:
         parser.error(f"postavite token u varijablu {args.token_env}; ne šaljite MT5 lozinku web stranici")
@@ -458,26 +628,65 @@ def main(argv: list[str] | None = None) -> int:
             ledger.halt()
             raise BridgeError("Prethodno izvršenje je ostalo bez potvrđenog ishoda. Most je zaustavljen radi ručne provjere MT5 pozicija i povijesti; ne brišite dnevnik niti ponovo uparujte račun prije provjere.")
         print("Aurum most je pokrenut. Samo XAUUSD; lokalni limit jedna ukupna pozicija. Ctrl+C za prekid.")
+        print(f"Brokerov UTC pomak: {args.broker_utc_offset_hours:+d} h. Ako broker promijeni pomak ili ljetno vrijeme, provjerite postavku; zaštita od zastarjelih podataka ostaje uključena.")
+        if args.broker_utc_offset_hours:
+            print("Dnevni P&L koristi konzervativnu procjenu dok format vremena povijesti dealova nije potvrđen: nejasni gubici se uključuju, nejasni dobici se izostavljaju.")
         print("Stvarni računi: " + ("izričito dopušteni; web potvrda je također obavezna." if args.allow_live else "izvršavanje blokirano; telemetrija je dopuštena."))
         print("Nema izvora vijesti: zadani News filter blokira MT5 naloge dok ne dodate feed ili ga izričito isključite u postavkama.")
+        snapshot_sent = False
+        last_status_log = 0.0
+        quote_time_blocked = False
+        last_quote_warning = 0.0
+        risk_accounting_blocked = False
+        last_risk_warning = 0.0
         while True:
             started = time.monotonic()
             try:
                 # Known execution results are deliverable even if the market
                 # has since closed or a fresh terminal read is unavailable.
                 flush_acknowledgments(api, ledger, initial_account_id)
-                snapshot = snapshot_from_terminal(mt5, args.symbol)
+                # Telemetry includes the raw broker timestamp and its explicit
+                # UTC conversion. Order execution uses the same conversion
+                # with strict freshness checks and unchanged UTC order expiry.
+                snapshot = snapshot_from_terminal(mt5, args.symbol, require_fresh=False, broker_utc_offset_hours=args.broker_utc_offset_hours)
                 if snapshot["accountId"] != initial_account_id:
                     raise BridgeError("MT5 račun je promijenjen. Most je potrebno zaustaviti i ponovo upariti.")
-                api.request("POST", "/snapshot", snapshot)
-                command = api.request("GET", "/command").get("command")
+                try:
+                    validate_tick_time(snapshot["timestamp"], int(time.time() * 1000))
+                    if quote_time_blocked:
+                        print("Vrijeme XAUUSD kotacija ponovo je unutar dopuštenih granica.")
+                    quote_time_blocked = False
+                except BridgeError as error:
+                    if not quote_time_blocked or time.monotonic() - last_quote_warning >= 60:
+                        print(str(error), file=sys.stderr)
+                        last_quote_warning = time.monotonic()
+                    quote_time_blocked = True
+                snapshot_response = api.request("POST", "/snapshot", snapshot)
+                if not snapshot_sent or time.monotonic() - last_status_log >= 60:
+                    suffix = " Izvršavanje čeka ispravno vrijeme ticka." if quote_time_blocked else " Čekam provjeru agenata ili nalog."
+                    print("MT5 podaci poslani; most povezan." + suffix)
+                    last_status_log = time.monotonic()
+                snapshot_sent = True
+                ambiguous_daily_pnl = snapshot.get("dailyPnlUpperBound", snapshot["dailyPnl"]) != snapshot["dailyPnl"]
+                if ambiguous_daily_pnl and snapshot_response.get("riskAccountingVersion") != 2:
+                    if not risk_accounting_blocked or time.monotonic() - last_risk_warning >= 60:
+                        print("Izvršavanje pauzirano: ažurirajte Cloudflare Worker na podršku za dnevni rizik verzije 2. Dnevni P&L ima neizvjesne vremenske granice; telemetrija se nastavlja, nalozi se ne preuzimaju.", file=sys.stderr)
+                        last_risk_warning = time.monotonic()
+                    risk_accounting_blocked = True
+                    command = None
+                else:
+                    if risk_accounting_blocked:
+                        print("Workerova obrada dnevnog rizika je usklađena; provjera naloga se nastavlja.")
+                    risk_accounting_blocked = False
+                    command = api.request("GET", "/command").get("command")
                 if command is not None:
                     if not isinstance(command, dict):
                         raise BridgeError("Neispravan format naloga.")
-                    result = process_command(mt5, ledger, command, args.symbol, args.allow_live)
+                    result = process_command(mt5, ledger, command, args.symbol, args.allow_live, broker_utc_offset_hours=args.broker_utc_offset_hours)
                     flush_acknowledgments(api, ledger, initial_account_id)
                     print("Nalog: " + result["status"] + ". " + result.get("message", ""))
             except ApiError as error:
+                snapshot_sent = False
                 print(str(error), file=sys.stderr)
                 if error.status in (401, 403, 409):
                     if error.status == 409:
@@ -485,8 +694,10 @@ def main(argv: list[str] | None = None) -> int:
                         print("Potvrda izvršenja nije prihvaćena. Provjerite MT5 povijest i poslužiteljski nalog prije ponovnog uparivanja; lokalni dnevnik je sačuvan.", file=sys.stderr)
                     return 2
             except BridgeError as error:
+                snapshot_sent = False
                 print(str(error), file=sys.stderr)
             except Exception:
+                snapshot_sent = False
                 print("Neočekivana greška terminala ili podataka; nalog nije automatski ponovljen.", file=sys.stderr)
             time.sleep(max(0, args.interval - (time.monotonic() - started)))
     except BridgeError as error:

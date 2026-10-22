@@ -78,14 +78,16 @@ $env:AURUM_BRIDGE_TOKEN = [System.Net.NetworkCredential]::new('', $bridgeSecret)
 5. Kopirajte URL mosta iz web prozora i umjesto `URL_IZ_PROZORA` upišite tu cijelu HTTPS adresu koja završava s `/api/bridge`:
 
 ```powershell
-.\.venv\Scripts\python.exe bridge/mt5_bridge.py --url "URL_IZ_PROZORA" --token-env AURUM_BRIDGE_TOKEN --symbol XAUUSD
+.\.venv\Scripts\python.exe bridge/mt5_bridge.py --url "URL_IZ_PROZORA" --token-env AURUM_BRIDGE_TOKEN --symbol XAUUSD.s --broker-utc-offset-hours 0
 ```
 
-URL je adresa vašeg Cloudflare Workera, a ne Macova loopback adresa. Ako je brokerski simbol drukčiji, prilagodite `--symbol`. Terminal i prozor mosta ostavite otvorene.
+URL je adresa vašeg Cloudflare Workera, a ne Macova loopback adresa. Ako je brokerski simbol drukčiji, prilagodite `--symbol`. UTC pomak zadano je **0**: mijenjajte ga samo nakon mjerenja vremena ticka prema ispravnom UTC satu. U potvrđenom primjeru PU Prime `XAUUSD.s` tick pokazuje 16:29:31 uz PC UTC 13:29:31, pa se koristi `--broker-utc-offset-hours 3`. To nije trajni pomak za svaki PU Prime račun; ponovno provjerite nakon promjene ljetnog vremena. [Detaljne upute i dijagnostika](bridge/README.md#ako-most-javlja-zastarjeli-tick-ili-neispravno-vrijeme). Terminal i prozor mosta ostavite otvorene.
 
 6. Pričekajte da web prikaže povezani račun. Provjerite identitet **`login@server`**, vrstu računa, valutu i spread prije omogućavanja automatizacije. Za početak postavite **Maksimalno pozicija = 1**: Windows most uvijek dopušta najviše jednu otvorenu poziciju na cijelom računu, čak i ako u web postavkama odaberete veći limit.
 
 Most prenosi M5 svijeće, stanje računa i sve otvorene pozicije. Provjerava simbol, identitet računa i servera, rok naloga, spread, odstupanje cijene, lot, SL/TP i marginu. Lokalni SQLite dnevnik i red potvrda čuvaju ishod naloga kroz restart i sprječavaju ponovno slanje. Kod neizvjesnog izvršenja most se zaustavlja radi ručne provjere u MT5; nemojte brisati dnevnik radi ponovnog pokretanja prije provjere pozicija i povijesti.
+
+Ako most javlja zastarjeli tick iako se kotacije mijenjaju, pokrenite čitanje vremena bez ključa i bez naloga: `.\.venv\Scripts\python.exe bridge\mt5_bridge.py --diagnose --symbol XAUUSD.s`. [Upute za provjeru UTC vremena](bridge/README.md#ako-most-javlja-zastarjeli-tick-ili-neispravno-vrijeme) objašnjavaju rezultate. Veza računa i svježina cijene prikazuju se odvojeno: stanje računa ostaje vidljivo, a stara ili buduća kotacija blokira nove naloge. Za tu promjenu potrebni su ažurirani Windows most i objavljeni Worker.
 
 ### Vijesti i stvarni račun
 

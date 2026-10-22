@@ -88,8 +88,17 @@ export function evaluate(snapshot: MarketSnapshot, suppliedSettings: Settings, n
   const proposed: Direction = buyVotes >= 2 && sellVotes === 0 ? 'BUY' : sellVotes >= 2 && buyVotes === 0 ? 'SELL' : 'WAIT';
   const spread = priceValid ? (market.ask - market.bid) / market.point : Infinity;
   if (spread > settings.maxSpreadPoints + 1e-7) reasons.push('Spread je veći od dopuštenog limita.');
-  // dailyPnl is today's realized P&L. Floating losses reduce the budget immediately.
-  const dailyBaseline = priceValid && positive(market.balance - market.dailyPnl) ? market.balance - market.dailyPnl : market.balance;
+  // An ambiguous broker day supplies lower/upper realized-P&L bounds. Use the
+  // upper bound for the smallest possible opening balance and the lower bound
+  // for consumed loss; substituting the lower bound into both can expand risk.
+  const conservativePnl = market.dailyPnlConservative === true;
+  const pnlBoundsValid = !conservativePnl || finite(market.dailyPnl) && finite(market.dailyPnlUpperBound) && market.dailyPnlUpperBound >= market.dailyPnl;
+  const dailyBaseline = conservativePnl
+    ? pnlBoundsValid ? Math.max(0, market.balance - market.dailyPnlUpperBound!) : 0
+    : priceValid && positive(market.balance - market.dailyPnl) ? market.balance - market.dailyPnl : market.balance;
+  if (conservativePnl && (!pnlBoundsValid || !positive(dailyBaseline))) reasons.push('Granice dnevnog rezultata ili početno stanje računa nisu valjani za izračun rizika.');
+  // dailyPnl is the exact realized P&L or its conservative lower bound.
+  // Floating losses reduce either budget immediately; floating gains do not.
   const lossIncludingFloating = priceValid ? market.dailyPnl + Math.min(0, market.equity - market.balance) : 0;
   if (positive(dailyBaseline) && lossIncludingFloating <= -dailyBaseline * settings.maxDailyLossPercent / 100) reasons.push('Dosegnut je maksimalni dnevni gubitak uključujući otvorene gubitke.');
   if (Array.isArray(market.positions) && market.positions.length >= settings.maxPositions) reasons.push('Dosegnut je limit otvorenih pozicija na računu.');

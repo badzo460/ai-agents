@@ -15,6 +15,8 @@ const COOKIE = 'aurum_session';
 const SESSION_MS = 8 * 60 * 60 * 1000;
 const BRIDGE_MS = 24 * 60 * 60 * 1000;
 const FRESH_MS = 30_000;
+const EARLIEST_QUOTE_MS = Date.UTC(2000, 0, 1);
+const MAX_CLOCK_OFFSET_MS = 24 * 60 * 60 * 1000;
 const encoder = new TextEncoder();
 const json = (data: unknown, status = 200, headers: HeadersInit = {}) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers } });
 class ApiError extends Error { constructor(message: string, readonly status = 400) { super(message); } }
@@ -105,16 +107,31 @@ export function parseSettings(input: Record<string, unknown>, current: Settings)
 
 export function parseSnapshot(input: Record<string, unknown>, now = Date.now()): MarketSnapshot {
   if (!string(input.symbol, 32) || !isGoldSymbol(input.symbol)) throw new ApiError('Dozvoljen je isključivo XAUUSD i njegov brokerski sufiks.');
-  if (!number(input.timestamp, now - FRESH_MS, now + 5000)) throw new ApiError('MT5 snimka je zastarjela ili vrijeme računala nije usklađeno.');
+  // A quiet or closed market can leave the latest quote unchanged for days.
+  // Accept its original time for account telemetry; evaluate/canIssueCommand
+  // independently require a quote no older than 30s and no more than 5s ahead.
+  if (!number(input.timestamp, EARLIEST_QUOTE_MS, now + MAX_CLOCK_OFFSET_MS)) throw new ApiError('MT5 vrijeme kotacije nije valjano. Provjerite vrijeme računala i podatke terminala.');
+  const hasBrokerTime = 'brokerTimestamp' in input;
+  const hasBrokerOffset = 'brokerUtcOffsetMinutes' in input;
+  if (hasBrokerTime !== hasBrokerOffset) throw new ApiError('Izvorno vrijeme brokera i UTC pomak moraju biti poslani zajedno.');
+  if (hasBrokerTime) {
+    if (!number(input.brokerTimestamp, Number.MIN_VALUE, Number.MAX_VALUE) || !number(input.brokerUtcOffsetMinutes, -720, 840) || !Number.isInteger(input.brokerUtcOffsetMinutes) || input.brokerUtcOffsetMinutes % 60 !== 0) throw new ApiError('Neispravno izvorno vrijeme brokera ili UTC pomak.');
+    if (Math.abs(input.brokerTimestamp - input.brokerUtcOffsetMinutes * 60000 - (input.timestamp as number)) > 1) throw new ApiError('Vrijeme kotacije nije usklađeno s navedenim UTC pomakom brokera.');
+  }
   if (!string(input.accountId, 128) || !['demo', 'real'].includes(String(input.accountMode)) || !string(input.currency, 8)) throw new ApiError('Nedostaju valjani podaci računa.');
   for (const key of ['bid', 'ask', 'point', 'tickSize', 'tickValue', 'volumeMin', 'volumeMax', 'volumeStep'] as const) if (!number(input[key], Number.MIN_VALUE, 1e9)) throw new ApiError(`Neispravan MT5 podatak: ${key}.`);
   if ((input.ask as number) < (input.bid as number) || (input.volumeMin as number) > (input.volumeMax as number)) throw new ApiError('Neispravan bid/ask ili raspon volumena.');
   for (const key of ['balance', 'equity'] as const) if (!number(input[key], 0, 1e12)) throw new ApiError(`Neispravan MT5 podatak: ${key}.`);
   if (!number(input.dailyPnl, -1e12, 1e12)) throw new ApiError('Neispravan dnevni rezultat.');
+  if ('dailyPnlConservative' in input && typeof input.dailyPnlConservative !== 'boolean') throw new ApiError('Oznaka konzervativnog dnevnog rezultata mora biti boolean.');
+  if (input.dailyPnlConservative === true && !('dailyPnlUpperBound' in input)) throw new ApiError('Konzervativni dnevni rezultat zahtijeva gornju granicu.');
+  if ('dailyPnlUpperBound' in input && (!number(input.dailyPnlUpperBound, -1e12, 1e12) || input.dailyPnlUpperBound < (input.dailyPnl as number))) throw new ApiError('Gornja granica dnevnog rezultata mora biti valjana i najmanje jednaka donjoj granici.');
   if (!Array.isArray(input.candles) || input.candles.length < 30 || input.candles.length > 500) throw new ApiError('Potrebno je između 30 i 500 završenih svijeća.');
   let previous = 0;
+  // Broker clock offsets can affect bars as well as quotes. Preserve them for
+  // telemetry; the engine separately rejects future bars for order proposals.
   for (const candle of input.candles) {
-    if (!candle || typeof candle !== 'object' || !number(candle.time, previous + 1, Math.floor(now / 1000) + 60)) throw new ApiError('Neispravna vremena svijeća.');
+    if (!candle || typeof candle !== 'object' || !number(candle.time, previous + 1, Math.floor((now + MAX_CLOCK_OFFSET_MS) / 1000))) throw new ApiError('Neispravna vremena svijeća.');
     for (const key of ['open', 'high', 'low', 'close'] as const) if (!number(candle[key], Number.MIN_VALUE, 1e9)) throw new ApiError('Neispravna cijena svijeće.');
     if (!number(candle.volume, 0, 1e12) || candle.low > Math.min(candle.open, candle.close) || candle.high < Math.max(candle.open, candle.close) || candle.high < candle.low) throw new ApiError('Neispravan OHLC raspon.');
     previous = candle.time;
@@ -254,7 +271,7 @@ export class TradingRoom {
         this.record.state.connected = true;
         this.queue(now);
         await this.persist();
-        return json({ ok: true });
+        return json({ ok: true, riskAccountingVersion: 2 });
       }
       if (path === '/api/bridge/command' && request.method === 'GET') {
         this.refresh(now);
